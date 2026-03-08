@@ -77,6 +77,15 @@ static const int ECHO_TIMEOUT_US = 30000;  // 30 ms max wait for echo
 #define LEDC_DUTY_RES          LEDC_TIMER_10_BIT  // 0..1023
 #define BUZZER_DUTY            512                // ~50%
 
+// LED PWM settings
+#define LED_TIMER_USED         LEDC_TIMER_1
+#define LED_CHANNEL_FL         LEDC_CHANNEL_1
+#define LED_CHANNEL_BL         LEDC_CHANNEL_2
+#define LED_CHANNEL_FR         LEDC_CHANNEL_3
+#define LED_CHANNEL_BR         LEDC_CHANNEL_4
+#define LED_DUTY_RES           LEDC_TIMER_8_BIT   // 0..255
+#define LED_MAX_DUTY           255
+
 static bool buzzer_muted = false;
 
 // For pulsing the buzzer in CAUTION state (beep-beep)
@@ -380,6 +389,94 @@ static void update_buzzer(int min_dist_cm)
 }
 
 ///////////////////////////////////////////////////////////////
+// --------------------- LED CONTROL -------------------------//
+///////////////////////////////////////////////////////////////
+
+// Initialize PWM for all 4 LEDs
+static void led_init_pwm(void)
+{
+    ledc_timer_config_t led_timer = {
+        .speed_mode       = LEDC_MODE_USED,
+        .timer_num        = LED_TIMER_USED,
+        .duty_resolution  = LED_DUTY_RES,
+        .freq_hz          = 5000,
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&led_timer);
+
+    ledc_channel_config_t ch_fl = {
+        .gpio_num   = LED_FRONT_LEFT,
+        .speed_mode = LEDC_MODE_USED,
+        .channel    = LED_CHANNEL_FL,
+        .timer_sel  = LED_TIMER_USED,
+        .duty       = 0,
+        .hpoint     = 0
+    };
+    ledc_channel_config(&ch_fl);
+
+    ledc_channel_config_t ch_bl = {
+        .gpio_num   = LED_BACK_LEFT,
+        .speed_mode = LEDC_MODE_USED,
+        .channel    = LED_CHANNEL_BL,
+        .timer_sel  = LED_TIMER_USED,
+        .duty       = 0,
+        .hpoint     = 0
+    };
+    ledc_channel_config(&ch_bl);
+
+    ledc_channel_config_t ch_fr = {
+        .gpio_num   = LED_FRONT_RIGHT,
+        .speed_mode = LEDC_MODE_USED,
+        .channel    = LED_CHANNEL_FR,
+        .timer_sel  = LED_TIMER_USED,
+        .duty       = 0,
+        .hpoint     = 0
+    };
+    ledc_channel_config(&ch_fr);
+
+    ledc_channel_config_t ch_br = {
+        .gpio_num   = LED_BACK_RIGHT,
+        .speed_mode = LEDC_MODE_USED,
+        .channel    = LED_CHANNEL_BR,
+        .timer_sel  = LED_TIMER_USED,
+        .duty       = 0,
+        .hpoint     = 0
+    };
+    ledc_channel_config(&ch_br);
+}
+
+// Set one LED brightness
+static void led_set_brightness(ledc_channel_t channel, int duty)
+{
+    if (duty < 0) duty = 0;
+    if (duty > LED_MAX_DUTY) duty = LED_MAX_DUTY;
+
+    ledc_set_duty(LEDC_MODE_USED, channel, duty);
+    ledc_update_duty(LEDC_MODE_USED, channel);
+}
+
+// Update one LED brightness from distance
+static void led_update(ledc_channel_t channel, int dist_cm)
+{
+    int duty = 0;
+
+    // LED OFF when safely far away
+    if (dist_cm > SAFE_DIST_CM) {
+        duty = 0;
+    }
+    // LED FULL brightness when very close
+    else if (dist_cm <= DANGER_DIST_CM) {
+        duty = LED_MAX_DUTY;
+    }
+    // Between SAFE and DANGER, increase brightness as distance gets smaller
+    else {
+        duty = ((SAFE_DIST_CM - dist_cm) * LED_MAX_DUTY) / (SAFE_DIST_CM - DANGER_DIST_CM);
+    }
+
+    led_set_brightness(channel, duty);
+}
+
+///////////////////////////////////////////////////////////////
 // -------------------- STATUS LOGIC -------------------------
 ///////////////////////////////////////////////////////////////
 
@@ -388,12 +485,6 @@ static const char* status_from_distance(int d)
     if (d > SAFE_DIST_CM) return "SAFE";
     if (d > DANGER_DIST_CM) return "CAUTION";
     return "DANGER";
-}
-
-static void led_update(gpio_num_t led_pin, int dist_cm)
-{
-    // LED ON when NOT safe (close obstacle)
-    gpio_set_level(led_pin, (dist_cm < SAFE_DIST_CM) ? 1 : 0);
 }
 
 ///////////////////////////////////////////////////////////////
@@ -433,13 +524,9 @@ void app_main(void)
 {
     // -------- GPIO CONFIG --------
 
-    // Outputs: LEDs + Trigs + LCD pins
+    // Outputs: Trigs + LCD pins
     gpio_config_t out_cfg = {
-        .pin_bit_mask = (1ULL << LED_BACK_LEFT) |
-                        (1ULL << LED_FRONT_LEFT) |
-                        (1ULL << LED_BACK_RIGHT) |
-                        (1ULL << LED_FRONT_RIGHT) |
-                        (1ULL << FL_TRIG) | (1ULL << BL_TRIG) |
+        .pin_bit_mask = (1ULL << FL_TRIG) | (1ULL << BL_TRIG) |
                         (1ULL << FR_TRIG) | (1ULL << BR_TRIG) |
                         (1ULL << LCD_RS) | (1ULL << LCD_EN) |
                         (1ULL << LCD_D4) | (1ULL << LCD_D5) |
@@ -475,14 +562,14 @@ void app_main(void)
     gpio_config(&btn_cfg);
 
     // Turn off LEDs initially
-    gpio_set_level(LED_BACK_LEFT, 0);
-    gpio_set_level(LED_FRONT_LEFT, 0);
-    gpio_set_level(LED_BACK_RIGHT, 0);
-    gpio_set_level(LED_FRONT_RIGHT, 0);
+    // LED PWM init below starts them at 0 brightness
 
     // Init potentiometer ADC
     pot_init();
     update_safe_threshold_from_pot();
+
+    // Init LED PWM
+    led_init_pwm();
 
     // Init buzzer PWM
     buzzer_init_pwm();
@@ -523,10 +610,10 @@ void app_main(void)
         const char *status = status_from_distance(minD);
 
         // LEDs show which side is close
-        led_update(LED_FRONT_LEFT,  dFL);
-        led_update(LED_FRONT_RIGHT, dFR);
-        led_update(LED_BACK_LEFT,   dBL);
-        led_update(LED_BACK_RIGHT,  dBR);
+        led_update(LED_CHANNEL_FL, dFL);
+        led_update(LED_CHANNEL_FR, dFR);
+        led_update(LED_CHANNEL_BL, dBL);
+        led_update(LED_CHANNEL_BR, dBR);
 
         // Buzzer based on MIN distance
         update_buzzer(minD);
