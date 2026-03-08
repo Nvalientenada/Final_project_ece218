@@ -10,6 +10,7 @@
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
+#include "esp_adc/adc_oneshot.h"
 
 ////////////
 // PIN MAP //
@@ -48,14 +49,23 @@
 #define LCD_D6           GPIO_NUM_10
 #define LCD_D7           GPIO_NUM_9
 
+// Potentiometer on GPIO 8
+#define POT_GPIO         GPIO_NUM_8
+#define POT_ADC_UNIT     ADC_UNIT_1
+#define POT_ADC_CHANNEL  ADC_CHANNEL_7
+
 ///////////////
 // SETTINGS  //
 ///////////////
 static const char *TAG = "PARK_ASSIST";
 
 // Distance thresholds (cm)
-static const int SAFE_DIST_CM   = 60;
-static const int DANGER_DIST_CM = 30;
+static int SAFE_DIST_CM = 60;
+static const int DANGER_DIST_CM = 15;
+
+// Pot SAFE threshold range (cm)
+static const int SAFE_MIN_CM = 30;
+static const int SAFE_MAX_CM = 80;
 
 // Timeouts
 static const int ECHO_TIMEOUT_US = 30000;  // 30 ms max wait for echo
@@ -71,6 +81,12 @@ static bool buzzer_muted = false;
 
 // For pulsing the buzzer in CAUTION state (beep-beep)
 static int beep_phase = 0;
+
+// ADC handle for potentiometer
+static adc_oneshot_unit_handle_t adc_handle = NULL;
+
+// Raw pot value for debug
+static int pot_raw_debug = 0;
 
 /////////////////
 // LCD DRIVER  //
@@ -224,6 +240,81 @@ static int read_distance_cm(gpio_num_t trig, gpio_num_t echo)
 }
 
 ///////////////////////////////////////////////////////////////
+// -------------------- POT CONTROL --------------------------//
+///////////////////////////////////////////////////////////////
+
+// Initialize ADC for potentiometer on GPIO 8
+static void pot_init(void)
+{
+    // Make GPIO8 a plain input with no pulls
+    gpio_config_t pot_cfg = {
+        .pin_bit_mask = (1ULL << POT_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&pot_cfg);
+
+    adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id = POT_ADC_UNIT,
+        .ulp_mode = ADC_ULP_MODE_DISABLE
+    };
+
+    if (adc_oneshot_new_unit(&unit_cfg, &adc_handle) != ESP_OK) {
+        adc_handle = NULL;
+        ESP_LOGW(TAG, "Pot ADC init failed");
+        return;
+    }
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten = ADC_ATTEN_DB_11
+    };
+
+    if (adc_oneshot_config_channel(adc_handle, POT_ADC_CHANNEL, &chan_cfg) != ESP_OK) {
+        adc_handle = NULL;
+        ESP_LOGW(TAG, "Pot ADC channel config failed");
+        return;
+    }
+}
+
+// Read potentiometer and update SAFE threshold
+static void update_safe_threshold_from_pot(void)
+{
+    if (adc_handle == NULL) return;
+
+    int sum = 0;
+    int raw = 0;
+    int good_reads = 0;
+
+    // average a few readings so the threshold is stable
+    for (int i = 0; i < 8; i++) {
+        if (adc_oneshot_read(adc_handle, POT_ADC_CHANNEL, &raw) == ESP_OK) {
+            sum += raw;
+            good_reads++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+
+    if (good_reads == 0) return;
+
+    int avg = sum / good_reads;
+    pot_raw_debug = avg;
+
+    if (avg < 0) avg = 0;
+    if (avg > 4095) avg = 4095;
+
+    // Map potentiometer value to SAFE threshold range
+    SAFE_DIST_CM = SAFE_MIN_CM + (avg * (SAFE_MAX_CM - SAFE_MIN_CM)) / 4095;
+
+    // Make sure SAFE always stays above DANGER
+    if (SAFE_DIST_CM <= DANGER_DIST_CM) {
+        SAFE_DIST_CM = DANGER_DIST_CM + 1;
+    }
+}
+
+///////////////////////////////////////////////////////////////
 // -------------------- BUZZER CONTROL -----------------------
 ///////////////////////////////////////////////////////////////
 
@@ -278,8 +369,8 @@ static void update_buzzer(int min_dist_cm)
 
     // CAUTION: beep-beep 
     if (min_dist_cm > DANGER_DIST_CM) {
-        beep_phase = (beep_phase + 1) % 4; // 0..9
-        if (beep_phase < 2) buzzer_tone(1000); // ON ~30% of the time
+        beep_phase = (beep_phase + 1) % 2; // faster caution beep
+        if (beep_phase == 0) buzzer_tone(1100);
         else buzzer_off();
         return;
     }
@@ -389,6 +480,10 @@ void app_main(void)
     gpio_set_level(LED_BACK_RIGHT, 0);
     gpio_set_level(LED_FRONT_RIGHT, 0);
 
+    // Init potentiometer ADC
+    pot_init();
+    update_safe_threshold_from_pot();
+
     // Init buzzer PWM
     buzzer_init_pwm();
     buzzer_off();
@@ -403,6 +498,9 @@ void app_main(void)
     while (1) {
         // Button check
         handle_button_toggle_mute();
+
+        // Update SAFE threshold from potentiometer
+        update_safe_threshold_from_pot();
 
         // Read sensors ONE AT A TIME 
         int dFL = read_distance_cm(FL_TRIG, FL_ECHO);
@@ -439,17 +537,18 @@ void app_main(void)
 
         snprintf(line0, sizeof(line0), "Dist:%3d cm", minD);
         if (buzzer_muted) {
-            snprintf(line1, sizeof(line1), "%s MUTED", status);
+            snprintf(line1, sizeof(line1), "M %s T%02d", status, SAFE_DIST_CM);
         } else {
-            snprintf(line1, sizeof(line1), "%s", status);
+            snprintf(line1, sizeof(line1), "%s T%02d", status, SAFE_DIST_CM);
         }
 
         lcd_print_line(0, line0);
         lcd_print_line(1, line1);
 
         // Serial log in monitor
-        ESP_LOGI(TAG, "FL:%d FR:%d BL:%d BR:%d | MIN:%d (%s)%s",
-                 dFL, dFR, dBL, dBR, minD, status, buzzer_muted ? " [MUTED]" : "");
+        ESP_LOGI(TAG, "FL:%d FR:%d BL:%d BR:%d | MIN:%d (%s) | SAFE:%d DANGER:%d | POT_RAW:%d%s",
+                 dFL, dFR, dBL, dBR, minD, status, SAFE_DIST_CM, DANGER_DIST_CM, pot_raw_debug,
+                 buzzer_muted ? " [MUTED]" : "");
 
         // This loop delay also controls the beep timing for CAUTION
         vTaskDelay(pdMS_TO_TICKS(200));
