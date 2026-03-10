@@ -61,11 +61,14 @@ static const char *TAG = "PARK_ASSIST";
 
 // Distance thresholds (cm)
 static int SAFE_DIST_CM = 60;
-static const int DANGER_DIST_CM = 15;
+static int DANGER_DIST_CM = 45;   // always updated to SAFE_DIST_CM - 15
 
 // Pot SAFE threshold range (cm)
 static const int SAFE_MIN_CM = 30;
 static const int SAFE_MAX_CM = 80;
+
+// Keep DANGER 15 cm below SAFE
+static const int THRESHOLD_GAP_CM = 15;
 
 // Timeouts
 static const int ECHO_TIMEOUT_US = 30000;  // 30 ms max wait for echo
@@ -316,6 +319,14 @@ static void update_safe_threshold_from_pot(void)
 
     // Map potentiometer value to SAFE threshold range
     SAFE_DIST_CM = SAFE_MIN_CM + (avg * (SAFE_MAX_CM - SAFE_MIN_CM)) / 4095;
+
+    // Update DANGER threshold so it always stays 15 cm below SAFE
+    DANGER_DIST_CM = SAFE_DIST_CM - THRESHOLD_GAP_CM;
+
+    // Make sure DANGER never goes below 5 cm
+    if (DANGER_DIST_CM < 5) {
+        DANGER_DIST_CM = 5;
+    }
 
     // Make sure SAFE always stays above DANGER
     if (SAFE_DIST_CM <= DANGER_DIST_CM) {
@@ -624,9 +635,9 @@ void app_main(void)
 
         snprintf(line0, sizeof(line0), "Dist:%3d cm", minD);
         if (buzzer_muted) {
-            snprintf(line1, sizeof(line1), "M %s T%02d", status, SAFE_DIST_CM);
+            snprintf(line1, sizeof(line1), "M %s S%02d", status, SAFE_DIST_CM);
         } else {
-            snprintf(line1, sizeof(line1), "%s T%02d", status, SAFE_DIST_CM);
+            snprintf(line1, sizeof(line1), "%s S%02d D%02d", status, SAFE_DIST_CM, DANGER_DIST_CM);
         }
 
         lcd_print_line(0, line0);
